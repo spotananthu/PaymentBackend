@@ -1,7 +1,6 @@
 # Payment Reconciliation Service
 
 **Live:** https://payment-reconciliation-api-53vz.onrender.com <br>
-**Docs:** https://payment-reconciliation-api-53vz.onrender.com/docs <br>
 **Repo:** https://github.com/spotananthu/PaymentBackend
 
 ---
