@@ -27,9 +27,9 @@ uvicorn app.main:app --reload
 
 API docs at http://localhost:8000/docs
 
-### Deploy (Render)
+---
 
-Push to GitHub, then on Render: New > Blueprint > select repo. The `render.yaml` provisions a free PostgreSQL instance and a Docker web service automatically. No manual env vars needed.
+### Deployment - Render
 
 ---
 
