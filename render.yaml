@@ -1,0 +1,24 @@
+databases:
+  - name: payment-reconciliation-db
+    plan: free
+    databaseName: payment_reconciliation
+    user: postgres
+
+services:
+  - type: web
+    name: payment-reconciliation-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: payment-reconciliation-db
+          property: connectionString
+      - key: APP_ENV
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: PORT
+        value: "8000"
+    healthCheckPath: /health
