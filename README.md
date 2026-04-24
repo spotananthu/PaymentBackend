@@ -1,331 +1,371 @@
 # Payment Reconciliation Service
 
-A backend service for processing payment lifecycle events, managing transaction state, and generating reconciliation reports.
+**Live:** https://payment-reconciliation-api-53vz.onrender.com
+**Docs:** https://payment-reconciliation-api-53vz.onrender.com/docs
+**Repo:** https://github.com/spotananthu/PaymentBackend
 
-## Quick Start
+---
+
+## Overview
+
+A backend service that ingests payment lifecycle events, derives transaction state through a state machine, and generates reconciliation reports with discrepancy detection.
+
+Built with FastAPI, PostgreSQL, SQLAlchemy 2.0, and Pydantic v2.
+
+---
+
+## Setup
+
+### Local
 
 ```bash
-# Local development
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 export DATABASE_URL=postgresql+psycopg://localhost:5432/payment_reconciliation
 uvicorn app.main:app --reload
 ```
 
-**Then open:** http://localhost:8000/docs (Interactive API documentation)
+API docs at http://localhost:8000/docs
+
+### Deploy (Render)
+
+Push to GitHub, then on Render: New > Blueprint > select repo. The `render.yaml` provisions a free PostgreSQL instance and a Docker web service automatically. No manual env vars needed.
 
 ---
 
-## 📊 Sample Data
-
-The provided `sample_events.json` contains **10,355 events** across **5 merchants** with realistic scenarios:
-
-| Metric | Value |
-|--------|-------|
-| Total events | 10,355 |
-| Merchants | 5 (QuickMart, FreshBasket, UrbanEats, TechBazaar, StyleHub) |
-| Transactions | ~3,800 |
-| Successful flows | ✅ initiated → processed → settled |
-| Failed transactions | ✅ initiated → failed |
-| Pending settlements | ✅ processed but not settled |
-| Duplicate events | ✅ Same event_id submitted multiple times |
-| Discrepancies | ✅ Settled after failure, stuck in processed |
-
-### Loading Sample Data
-
-```bash
-# Option 1: Use the bulk endpoint (via curl)
-curl -X POST http://localhost:8000/events/bulk \
-  -H "Content-Type: application/json" \
-  -d "{\"events\": $(cat sample_events.json)}"
-
-# Option 2: Use the interactive API docs
-# Open http://localhost:8000/docs → POST /events/bulk → Upload JSON
-```
-
-### Expected Results After Loading
-
-```bash
-# Check transaction stats
-curl http://localhost:8000/reconciliation/summary
-
-# Response shows:
-# - ~3,800 transactions
-# - ~42% settlement rate  
-# - ~300+ discrepancies detected
-```
-
----
-
-## 🔐 Idempotency (Critical Design)
-
-Duplicate event handling is **guaranteed** at three levels:
-
-1. **Application check**: Pre-query before insert returns early for duplicates
-2. **Database constraint**: `event_id` is PRIMARY KEY — DB rejects duplicates  
-3. **Race condition handling**: `IntegrityError` caught, returns existing event
-
-```python
-# Simplified flow (event_service.py)
-existing = db.get(Event, event_id)
-if existing:
-    return response(is_duplicate=True)  # ← No state update, returns early
-
-try:
-    db.add(event)
-    update_status(...)  # ← Only runs if insert succeeds
-    db.commit()
-except IntegrityError:
-    return response(is_duplicate=True)  # ← Concurrent duplicate handled
-```
-
-**Guarantee**: Submitting the same event twice will:
-- ❌ NOT create duplicate records
-- ❌ NOT update transaction state
-- ✅ Return `is_duplicate: true` safely
-
----
-
-## 🗄️ SQL Query Design
-
-All filtering, pagination, and aggregation execute at the **database level** using SQLAlchemy Core queries that compile to optimized SQL.
-
-### Transaction Listing
-```python
-# Compiles to: SELECT ... WHERE status = ? AND merchant_id = ? ORDER BY created_at LIMIT ? OFFSET ?
-query = select(Transaction)
-    .where(Transaction.status == status)
-    .where(Transaction.merchant_id == merchant_id)
-    .order_by(desc(Transaction.created_at))
-    .offset(offset).limit(page_size)
-```
-
-### Reconciliation Summary
-```python
-# Compiles to: SELECT merchant_id, COUNT(*), SUM(CASE WHEN status='settled' THEN 1 END) ... GROUP BY merchant_id
-query = select(
-    Transaction.merchant_id,
-    func.count(Transaction.id),
-    func.sum(case((Transaction.status == 'settled', 1), else_=0))
-).group_by(Transaction.merchant_id)
-```
-
-### Discrepancy Detection
-```python
-# Compiles to: SELECT ... WHERE NOT EXISTS (SELECT 1 FROM events WHERE event_type='settled' AND ...)
-settled_exists = select(Event.id).where(Event.event_type == 'settled').exists()
-query = select(Transaction).where(~settled_exists)
-```
-
----
-
-## 📊 Database Indexes
-
-Composite indexes designed based on actual query patterns:
-
-```sql
--- Single column indexes
-CREATE INDEX ix_transactions_status ON transactions(status);
-CREATE INDEX ix_transactions_created_at ON transactions(created_at);
-CREATE INDEX ix_events_transaction_id ON events(transaction_id);
-
--- Composite indexes for common query patterns
-CREATE INDEX ix_transactions_merchant_status ON transactions(merchant_id, status);
-CREATE INDEX ix_transactions_merchant_created ON transactions(merchant_id, created_at);
-CREATE INDEX ix_transactions_status_created ON transactions(status, created_at);
-CREATE INDEX ix_events_transaction_timestamp ON events(transaction_id, timestamp);
-```
-
----
-
-## ⚖️ Trade-offs & Decisions
-
-| Decision | Rationale | Alternative |
-|----------|-----------|-------------|
-| **Event ID as PK** | Database-level idempotency, no extra unique index needed | Separate UUID + unique constraint |
-| **Denormalized merchant_id in events** | Faster queries without JOIN through transactions | Normalize and JOIN |
-| **In-memory discrepancy pagination** | Low expected volume (<1% of transactions), simpler queries | SQL window functions with LIMIT/OFFSET |
-| **Sync processing** | Simpler implementation, adequate for expected load | Async with Celery for higher throughput |
-| **State machine in code** | Explicit transitions, easy to test and audit | Database triggers |
-
-### Discrepancy Pagination Note
-Discrepancy pagination currently happens in Python after SQL filtering. This was a **conscious tradeoff** to keep query complexity manageable. The SQL query itself uses WHERE clauses and EXISTS subqueries for filtering. For production scale, this could be moved to SQL using window functions.
-
----
-
-## 🛡️ Edge Cases Handled
-
-| Edge Case | How It's Handled |
-|-----------|------------------|
-| **Duplicate event ingestion** | Returns `is_duplicate: true` without state mutation |
-| **Invalid state transitions** | State machine rejects (e.g., `FAILED` → `SETTLED`) |
-| **Out-of-order events** | Events sorted by timestamp before processing |
-| **Concurrent duplicate submission** | `IntegrityError` caught, returns existing event |
-| **Terminal state protection** | No transitions allowed from `SETTLED` or `FAILED` |
-| **Null status prevention** | State machine returns `new_status=None` for no-op, code checks before assignment |
-
-**Example: Duplicate handling in production**
-```
-Request 1: POST /events {event_id: "evt-001"} → 201 Created, is_duplicate: false
-Request 2: POST /events {event_id: "evt-001"} → 200 OK, is_duplicate: true  ← No state change
-```
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         FastAPI                                  │
-├─────────────────────────────────────────────────────────────────┤
-│  API Layer                                                       │
-│  ├── POST /events         → Ingest events (idempotent)          │
-│  ├── GET  /transactions   → Query with filters                  │
-│  └── GET  /reconciliation → Summaries & discrepancies           │
-├─────────────────────────────────────────────────────────────────┤
-│  Service Layer (Business Logic + SQL)                            │
-│  ├── EventService         → Idempotency, state machine          │
-│  ├── TransactionService   → Queries, pagination                 │
-│  └── ReconciliationService→ Aggregations, anomaly detection     │
-├─────────────────────────────────────────────────────────────────┤
-│  Data Layer (PostgreSQL)                                         │
-│  ├── merchants            → Partner information                 │
-│  ├── transactions         → Current state (derived)             │
-│  └── events               → Immutable audit log                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Transaction State Machine:**
-```
-INITIATED → PROCESSED → SETTLED
-     ↓          ↓
-   FAILED ←────┘
-```
-
----
-
-## 📡 API Endpoints
+## API
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/events` | Ingest event (idempotent) |
-| `POST` | `/events/bulk` | Bulk ingest (10k+ optimized) |
-| `GET` | `/transactions` | List with filters/pagination |
-| `GET` | `/transactions/{id}` | Details with event history |
-| `GET` | `/reconciliation/summary` | Aggregated stats by merchant/status |
-| `GET` | `/reconciliation/discrepancies` | Find anomalies |
+| POST | /events | Ingest a single event (idempotent) |
+| POST | /events/bulk | Bulk ingest up to 50,000 events |
+| GET | /transactions | List transactions with filtering, sorting, pagination |
+| GET | /transactions/{id} | Transaction detail with full event history |
+| GET | /reconciliation/summary | Aggregated stats grouped by merchant, status, date, or merchant+status |
+| GET | /reconciliation/discrepancies | Detect anomalies across transactions |
+| GET | /health | Service health check |
 
-### Example: Event Ingestion
+### Event Ingestion
+
 ```bash
-curl -X POST http://localhost:8000/events \
+curl -X POST https://payment-reconciliation-api-53vz.onrender.com/events \
   -H "Content-Type: application/json" \
   -d '{
     "event_id": "evt-001",
     "event_type": "payment_initiated",
     "transaction_id": "txn-001",
-    "merchant_id": "merchant-001",
-    "merchant_name": "TechMart",
+    "merchant_id": "merchant_1",
+    "merchant_name": "QuickMart",
     "amount": 1500.00,
     "currency": "INR",
     "timestamp": "2026-01-15T10:30:00Z"
   }'
 ```
 
----
+Submitting the same `event_id` again returns `is_duplicate: true` without mutating state.
 
-## 🧪 Testing
+### Transaction Queries
 
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Key test cases covered:
-# - Duplicate event handling (idempotency)
-# - Bulk ingestion with duplicates
-# - Transaction state transitions
-# - Discrepancy detection scenarios
+```
+GET /transactions?status=settled&merchant_id=merchant_1&sort_by=amount&sort_order=desc&page=1&page_size=20
+GET /transactions?start_date=2026-01-01&end_date=2026-01-31
 ```
 
-Postman collection included: `postman_collection.json`
+Returns paginated results with `pagination.total_items`, `has_next`, `has_previous`.
+
+### Reconciliation
+
+```
+GET /reconciliation/summary?group_by=merchant
+GET /reconciliation/summary?group_by=status
+GET /reconciliation/summary?group_by=date
+GET /reconciliation/summary?group_by=merchant_status
+```
+
+Each returns per-group counts, amounts, and settlement rates. All aggregation runs in SQL via GROUP BY, COUNT, SUM, and CASE expressions.
+
+### Discrepancy Detection
+
+```
+GET /reconciliation/discrepancies?discrepancy_type=settled_after_failure&merchant_id=merchant_2&page_size=50
+```
+
+Five discrepancy types:
+
+| Type | Meaning |
+|------|---------|
+| processed_not_settled | Transaction reached "processed" but never "settled" |
+| settled_after_failure | Settlement event recorded after a failure event |
+| duplicate_settlement | Multiple settlement events for the same transaction |
+| missing_initiation | Processing/settlement events exist without an initiation event |
+| conflicting_events | Both failure and settlement events on the same transaction |
+
+Detection uses SQL subqueries with EXISTS/NOT EXISTS. No Python-side iteration over rows.
 
 ---
 
-## 📁 Project Structure
+## Quick Test (curl)
+
+All commands use the live production instance. Sample data is already loaded.
+
+```bash
+BASE=https://payment-reconciliation-api-53vz.onrender.com
+
+# 1. Health check
+curl -s $BASE/health
+
+# 2. Ingest a single event
+curl -s -X POST $BASE/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_id": "test-evt-001",
+    "event_type": "payment_initiated",
+    "transaction_id": "test-txn-001",
+    "merchant_id": "merchant_1",
+    "merchant_name": "QuickMart",
+    "amount": 2500.00,
+    "currency": "INR",
+    "timestamp": "2026-04-24T10:00:00Z"
+  }'
+
+# 3. Idempotency -- same event_id returns is_duplicate: true
+curl -s -X POST $BASE/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_id": "test-evt-001",
+    "event_type": "payment_initiated",
+    "transaction_id": "test-txn-001",
+    "merchant_id": "merchant_1",
+    "merchant_name": "QuickMart",
+    "amount": 2500.00,
+    "currency": "INR",
+    "timestamp": "2026-04-24T10:00:00Z"
+  }'
+
+# 4. Progress the transaction: processed then settled
+curl -s -X POST $BASE/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_id": "test-evt-002",
+    "event_type": "payment_processed",
+    "transaction_id": "test-txn-001",
+    "merchant_id": "merchant_1",
+    "merchant_name": "QuickMart",
+    "amount": 2500.00,
+    "currency": "INR",
+    "timestamp": "2026-04-24T10:05:00Z"
+  }'
+
+curl -s -X POST $BASE/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_id": "test-evt-003",
+    "event_type": "settled",
+    "transaction_id": "test-txn-001",
+    "merchant_id": "merchant_1",
+    "merchant_name": "QuickMart",
+    "amount": 2500.00,
+    "currency": "INR",
+    "timestamp": "2026-04-24T10:10:00Z"
+  }'
+
+# 5. Get transaction detail with full event history
+curl -s "$BASE/transactions/test-txn-001"
+
+# 6. List transactions -- filter by merchant and status
+curl -s "$BASE/transactions?merchant_id=merchant_1&status=settled&page_size=5"
+
+# 7. List transactions -- sort by amount descending
+curl -s "$BASE/transactions?sort_by=amount&sort_order=desc&page_size=5"
+
+# 8. List transactions -- date range filter
+curl -s "$BASE/transactions?start_date=2026-01-01&end_date=2026-01-31&page_size=5"
+
+# 9. Reconciliation summary -- group by merchant
+curl -s "$BASE/reconciliation/summary?group_by=merchant"
+
+# 10. Reconciliation summary -- group by status
+curl -s "$BASE/reconciliation/summary?group_by=status"
+
+# 11. Reconciliation summary -- group by date
+curl -s "$BASE/reconciliation/summary?group_by=date"
+
+# 12. Reconciliation summary -- group by merchant + status
+curl -s "$BASE/reconciliation/summary?group_by=merchant_status"
+
+# 13. Discrepancies -- all types with summary counts
+curl -s "$BASE/reconciliation/discrepancies?page_size=5"
+
+# 14. Discrepancies -- filter by type
+curl -s "$BASE/reconciliation/discrepancies?discrepancy_type=settled_after_failure&page_size=5"
+
+# 15. Discrepancies -- filter by merchant
+curl -s "$BASE/reconciliation/discrepancies?merchant_id=merchant_2&page_size=5"
+
+# 16. Discrepancies -- filter by type and merchant
+curl -s "$BASE/reconciliation/discrepancies?discrepancy_type=duplicate_settlement&merchant_id=merchant_3&page_size=5"
+```
+
+Pipe any command through `| python3 -m json.tool` for formatted output.
+
+---
+
+## Design Decisions
+
+### Idempotency
+
+`event_id` is the primary key of the events table. Duplicate handling at three levels:
+
+1. **Bulk deduplication** -- within a single bulk request, duplicate event_ids are collapsed before hitting the database.
+2. **Application check** -- a SELECT pre-filters IDs that already exist.
+3. **Database constraint** -- PK constraint rejects duplicates even under concurrent writes. IntegrityError is caught and handled gracefully.
+
+No duplicate event creates a new record or triggers a state transition.
+
+### State Machine
+
+Transaction status is derived from events using explicit transition rules:
+
+```
+INITIATED --> PROCESSED --> SETTLED
+    |              |
+    v              v
+  FAILED        FAILED
+```
+
+SETTLED and FAILED are terminal states. Out-of-order events are sorted by timestamp before processing. Invalid transitions (e.g. FAILED to SETTLED) are rejected; the event is stored but does not change transaction status.
+
+### Database Schema
+
+Three tables: `merchants`, `transactions`, `events`.
+
+- `event_id` as PK gives idempotency without an extra unique index.
+- `merchant_id` is denormalized on events to avoid JOINs through transactions for merchant-scoped queries.
+- Composite indexes match actual query patterns:
+
+```sql
+ix_transactions_merchant_status  (merchant_id, status)
+ix_transactions_merchant_created (merchant_id, created_at)
+ix_transactions_status_created   (status, created_at)
+ix_events_transaction_timestamp  (transaction_id, timestamp)
+```
+
+Full ER diagram and schema in `docs/DATABASE_DESIGN.md`.
+
+### SQL-Level Operations
+
+All filtering, pagination, sorting, and aggregation compile to SQL through SQLAlchemy. No data is pulled into Python for processing.
+
+- Transaction listing: `WHERE status = ? AND merchant_id = ? ORDER BY created_at LIMIT ? OFFSET ?`
+- Summary by merchant: `SELECT merchant_id, COUNT(*), SUM(amount), SUM(CASE WHEN status='settled' ...) GROUP BY merchant_id`
+- Discrepancy detection: `WHERE status = 'processed' AND NOT EXISTS (SELECT 1 FROM events WHERE event_type = 'settled' ...)`
+
+### Trade-offs
+
+| Decision | Rationale | Alternative considered |
+|----------|-----------|----------------------|
+| event_id as PK | DB-level idempotency, no extra index | Surrogate PK + unique constraint |
+| Denormalized merchant_id on events | Avoids JOIN for merchant-scoped queries | Normalized FK through transactions |
+| Sync processing | Simpler; adequate for assessment-scale load | Async with background workers |
+| In-code state machine | Explicit, testable, auditable | Database triggers |
+| Discrepancy pagination in Python | Keeps SQL queries simpler for multi-type detection | Window functions with LIMIT/OFFSET |
+
+---
+
+## Sample Data
+
+`sample_events.json` contains 10,355 events across 5 merchants with intentional scenarios:
+
+- Normal flows (initiated > processed > settled)
+- Failed transactions
+- Transactions stuck in "processed" (never settled)
+- Settlement after failure
+- Duplicate event_ids (tests idempotency)
+
+Load into a running instance:
+
+```bash
+curl -X POST http://localhost:8000/events/bulk \
+  -H "Content-Type: application/json" \
+  -d "{\"events\": $(cat sample_events.json)}"
+```
+
+After loading: ~3,800 transactions, 67.5% settlement rate, 665 discrepancies (380 processed_not_settled, 95 settled_after_failure, 95 duplicate_settlement, 95 conflicting_events).
+
+The production instance already has this data loaded.
+
+---
+
+## Testing
+
+```bash
+pytest tests/ -v
+```
+
+34 tests covering:
+
+- Single and bulk event ingestion
+- Idempotency (duplicate rejection)
+- State transitions (valid and invalid)
+- Transaction filtering, sorting, pagination
+- Reconciliation summary (all 4 group_by modes)
+- Discrepancy detection (all 5 types)
+- Edge cases: empty results, not found, invalid input
+
+Tests use an in-memory SQLite database. No external dependencies needed.
+
+Postman collection included at `postman_collection.json`.
+
+---
+
+## Project Structure
 
 ```
 app/
-├── api/v1/           # Route handlers
-├── core/             # Config, database, state machine
-├── models/           # SQLAlchemy models (with indexes)
-├── schemas/          # Pydantic validation
-├── services/         # Business logic + SQL queries
-└── main.py
-tests/                # Pytest test suite
-scripts/              # Sample data generation
+  main.py                       Entry point, lifespan handler
+  core/
+    config.py                   Pydantic settings, DATABASE_URL rewrite
+    database.py                 Engine, session management
+    state_machine.py            Transition rules, event-to-status mapping
+  models/
+    entities.py                 Merchant, Transaction, Event models
+  schemas/
+    event.py                    Ingestion request/response
+    transaction.py              Query params, detail response
+    reconciliation.py           Summary, discrepancy response
+    common.py                   Shared pagination
+  repositories/
+    event_repository.py         Event CRUD
+    transaction_repository.py   Filtered queries, sorting
+    merchant_repository.py      Auto-create on first event
+    reconciliation_repository.py  Aggregation queries
+  services/
+    event_service.py            Idempotent ingestion, bulk processing
+    transaction_service.py      Query orchestration
+    reconciliation_service.py   Summary generation, discrepancy detection
+  api/v1/
+    events.py                   POST /events, POST /events/bulk
+    transactions.py             GET /transactions, GET /transactions/{id}
+    reconciliation.py           GET /reconciliation/summary, /discrepancies
+    health.py                   GET /health
+tests/                          34 pytest tests
+scripts/                        Sample data generation
+docs/                           Database design documentation
 ```
-
----
-
-## 🚀 Setup & Deployment
-
-### Local Development
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export DATABASE_URL=postgresql+psycopg://localhost:5432/payment_reconciliation
-uvicorn app.main:app --reload
-# App: http://localhost:8000
-# API Docs: http://localhost:8000/docs
-```
-
-### 🌐 Live Deployment
-
-**Production URL:** `https://[YOUR-APP].onrender.com`
-
-Deployed on [Render](https://render.com) with managed PostgreSQL.
-
-#### Deploy Your Own:
-
-1. Push code to GitHub
-2. Go to [Render Dashboard](https://dashboard.render.com)
-3. Click **New → Blueprint** and connect your repo
-4. Render auto-detects `render.yaml` and provisions the database + web service
-5. Wait for build & deploy to complete
-
-Or deploy manually:
-```bash
-# 1. Create a PostgreSQL database on Render (Free tier)
-#    Dashboard → New → PostgreSQL → Copy the External Database URL
-
-# 2. Create a Web Service
-#    Dashboard → New → Web Service → Connect your GitHub repo
-#    Build Command: (uses Dockerfile automatically)
-#    Environment: Docker
-
-# 3. Add environment variable
-#    DATABASE_URL = <paste the Internal Database URL from step 1>
-```
-
-The app auto-configures via `DATABASE_URL` environment variable provided by Render.
-
-### Environment Variables
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | Required |
-| `APP_ENV` | Environment (development/production) | development |
-| `DEBUG` | Enable debug logging | false |
 
 ---
 
 ## Tech Stack
 
-| Technology | Why |
-|------------|-----|
-| **FastAPI** | Auto OpenAPI docs, Pydantic integration, async-ready |
-| **PostgreSQL** | ACID transactions, robust aggregations, mature indexing |
-| **SQLAlchemy 2.0** | Type-safe, compiles to optimized SQL |
-| **Pydantic v2** | 5-50x faster validation than v1 |
+- **FastAPI** -- auto-generated OpenAPI docs, Pydantic integration, dependency injection
+- **PostgreSQL** -- ACID transactions, aggregation functions, composite indexing
+- **SQLAlchemy 2.0** -- compiled SQL queries, type-safe ORM
+- **Pydantic v2** -- request/response validation
+- **psycopg 3** -- PostgreSQL driver
+- **Docker** -- multi-stage production build
 
 ---
 
-**Built for Setu Solutions Engineer Assessment**
+## AI Disclosure
+
+This project was developed with assistance from AI tool(Copilot) for debugging and documentation. All code was developed, reviewed, tested, and validated manually.
