@@ -27,6 +27,8 @@ uvicorn app.main:app --reload
 
 API docs at http://localhost:8000/docs
 
+### **[Testing Guide (curl commands)](docs/TESTING_GUIDE.md)** | **[Postman Collection](postman_collection.json)**
+
 ---
 
 ### Deployment - Render
@@ -101,112 +103,6 @@ Five discrepancy types:
 | conflicting_events | Both failure and settlement events on the same transaction |
 
 Detection uses SQL subqueries with EXISTS/NOT EXISTS. No Python-side iteration over rows.
-
----
-
-## Quick Test (curl)
-
-All commands use the live production instance. Sample data is already loaded.
-
-```bash
-BASE=https://payment-reconciliation-api-53vz.onrender.com
-
-# 1. Health check
-curl -s $BASE/health
-
-# 2. Ingest a single event
-curl -s -X POST $BASE/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "event_id": "test-evt-001",
-    "event_type": "payment_initiated",
-    "transaction_id": "test-txn-001",
-    "merchant_id": "merchant_1",
-    "merchant_name": "QuickMart",
-    "amount": 2500.00,
-    "currency": "INR",
-    "timestamp": "2026-04-24T10:00:00Z"
-  }'
-
-# 3. Idempotency -- same event_id returns is_duplicate: true
-curl -s -X POST $BASE/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "event_id": "test-evt-001",
-    "event_type": "payment_initiated",
-    "transaction_id": "test-txn-001",
-    "merchant_id": "merchant_1",
-    "merchant_name": "QuickMart",
-    "amount": 2500.00,
-    "currency": "INR",
-    "timestamp": "2026-04-24T10:00:00Z"
-  }'
-
-# 4. Progress the transaction: processed then settled
-curl -s -X POST $BASE/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "event_id": "test-evt-002",
-    "event_type": "payment_processed",
-    "transaction_id": "test-txn-001",
-    "merchant_id": "merchant_1",
-    "merchant_name": "QuickMart",
-    "amount": 2500.00,
-    "currency": "INR",
-    "timestamp": "2026-04-24T10:05:00Z"
-  }'
-
-curl -s -X POST $BASE/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "event_id": "test-evt-003",
-    "event_type": "settled",
-    "transaction_id": "test-txn-001",
-    "merchant_id": "merchant_1",
-    "merchant_name": "QuickMart",
-    "amount": 2500.00,
-    "currency": "INR",
-    "timestamp": "2026-04-24T10:10:00Z"
-  }'
-
-# 5. Get transaction detail with full event history
-curl -s "$BASE/transactions/test-txn-001"
-
-# 6. List transactions -- filter by merchant and status
-curl -s "$BASE/transactions?merchant_id=merchant_1&status=settled&page_size=5"
-
-# 7. List transactions -- sort by amount descending
-curl -s "$BASE/transactions?sort_by=amount&sort_order=desc&page_size=5"
-
-# 8. List transactions -- date range filter
-curl -s "$BASE/transactions?start_date=2026-01-01&end_date=2026-01-31&page_size=5"
-
-# 9. Reconciliation summary -- group by merchant
-curl -s "$BASE/reconciliation/summary?group_by=merchant"
-
-# 10. Reconciliation summary -- group by status
-curl -s "$BASE/reconciliation/summary?group_by=status"
-
-# 11. Reconciliation summary -- group by date
-curl -s "$BASE/reconciliation/summary?group_by=date"
-
-# 12. Reconciliation summary -- group by merchant + status
-curl -s "$BASE/reconciliation/summary?group_by=merchant_status"
-
-# 13. Discrepancies -- all types with summary counts
-curl -s "$BASE/reconciliation/discrepancies?page_size=5"
-
-# 14. Discrepancies -- filter by type
-curl -s "$BASE/reconciliation/discrepancies?discrepancy_type=settled_after_failure&page_size=5"
-
-# 15. Discrepancies -- filter by merchant
-curl -s "$BASE/reconciliation/discrepancies?merchant_id=merchant_2&page_size=5"
-
-# 16. Discrepancies -- filter by type and merchant
-curl -s "$BASE/reconciliation/discrepancies?discrepancy_type=duplicate_settlement&merchant_id=merchant_3&page_size=5"
-```
-
-Pipe any command through `| python3 -m json.tool` for formatted output.
 
 ---
 
@@ -314,7 +210,7 @@ pytest tests/ -v
 
 Tests use an in-memory SQLite database. No external dependencies needed.
 
-Postman collection included at `postman_collection.json`.
+For manual API testing: **[Testing Guide](docs/TESTING_GUIDE.md)** | **[Postman Collection](postman_collection.json)**
 
 ---
 
