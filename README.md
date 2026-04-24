@@ -25,9 +25,11 @@ export DATABASE_URL=postgresql+psycopg://localhost:5432/payment_reconciliation
 uvicorn app.main:app --reload
 ```
 
-API docs at http://localhost:8000/docs
 
-### **[Testing Guide (curl commands)](docs/TESTING_GUIDE.md)** | **[Postman Collection](postman_collection.json)**
+> [!IMPORTANT]
+> **Testing Resources**
+> - [Testing Guide (curl commands)](docs/TESTING_GUIDE.md)
+> - [Postman Collection](postman_collection.json)
 
 ---
 
