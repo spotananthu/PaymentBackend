@@ -2,7 +2,7 @@ databases:
   - name: payment-reconciliation-db
     plan: free
     databaseName: payment_reconciliation
-    user: postgres
+    user: paymentuser
 
 services:
   - type: web
