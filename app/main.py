@@ -4,6 +4,7 @@ Payment Reconciliation Service - Main Application Entry Point
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
@@ -50,6 +51,10 @@ def create_application() -> FastAPI:
     app.include_router(events.router, prefix="/events", tags=["Events"])
     app.include_router(transactions.router, prefix="/transactions", tags=["Transactions"])
     app.include_router(reconciliation.router, prefix="/reconciliation", tags=["Reconciliation"])
+    
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return RedirectResponse(url="/docs")
     
     return app
 
